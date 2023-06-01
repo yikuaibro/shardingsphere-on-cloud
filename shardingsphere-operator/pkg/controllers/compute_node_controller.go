@@ -20,6 +20,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/apache/shardingsphere-on-cloud/shardingsphere-operator/api/v1alpha1"
@@ -65,6 +66,13 @@ func (r *ComputeNodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.ConfigMap{}).
 		Complete(r)
 }
+
+// +kubebuilder:rbac:groups=shardingsphere.apache.org,resources=computenodes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=shardingsphere.apache.org,resources=computenodes/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile handles main function of this controller
 func (r *ComputeNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -128,10 +136,13 @@ func (r *ComputeNodeReconciler) createDeployment(ctx context.Context, cn *v1alph
 func (r *ComputeNodeReconciler) updateDeployment(ctx context.Context, cn *v1alpha1.ComputeNode, deploy *appsv1.Deployment) error {
 	exp := r.Deployment.Build(ctx, cn)
 	exp.ObjectMeta = deploy.ObjectMeta
-	exp.ObjectMeta.ResourceVersion = ""
 	exp.Labels = deploy.Labels
 	exp.Annotations = deploy.Annotations
-	return r.Deployment.Update(ctx, exp)
+
+	if !reflect.DeepEqual(deploy.Spec, exp.Spec) {
+		return r.Deployment.Update(ctx, exp)
+	}
+	return nil
 }
 
 func (r *ComputeNodeReconciler) getDeploymentByNamespacedName(ctx context.Context, namespacedName types.NamespacedName) (*appsv1.Deployment, error) {
@@ -162,21 +173,38 @@ func (r *ComputeNodeReconciler) createService(ctx context.Context, cn *v1alpha1.
 	return err
 }
 
+func (r *ComputeNodeReconciler) updateComputeNodePortBindings(ctx context.Context, cn *v1alpha1.ComputeNode) error {
+	if rt, err := r.getRuntimeComputeNode(ctx, types.NamespacedName{
+		Namespace: cn.Namespace,
+		Name:      cn.Name,
+	}); err == nil {
+		rt.Spec.PortBindings = cn.Spec.PortBindings
+		if err := r.Update(ctx, rt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (r *ComputeNodeReconciler) updateService(ctx context.Context, cn *v1alpha1.ComputeNode, cur *corev1.Service) error {
 	switch cn.Spec.ServiceType {
 	case corev1.ServiceTypeClusterIP:
+		pbs := []v1alpha1.PortBinding{}
+		copy(cn.Spec.PortBindings, pbs)
 		updateServiceClusterIP(cn.Spec.PortBindings)
-		if err := r.Update(ctx, cn); err != nil {
-			return err
+		if !reflect.DeepEqual(cn.Spec.PortBindings, pbs) {
+			return r.updateComputeNodePortBindings(ctx, cn)
 		}
 	case corev1.ServiceTypeExternalName:
 		fallthrough
 	case corev1.ServiceTypeLoadBalancer:
 		fallthrough
 	case corev1.ServiceTypeNodePort:
+		pbs := []v1alpha1.PortBinding{}
+		copy(cn.Spec.PortBindings, pbs)
 		updateServiceNodePort(cn.Spec.PortBindings, cur.Spec.Ports)
-		if err := r.Update(ctx, cn); err != nil {
-			return err
+		if !reflect.DeepEqual(cn.Spec.PortBindings, pbs) {
+			return r.updateComputeNodePortBindings(ctx, cn)
 		}
 	}
 
@@ -184,10 +212,15 @@ func (r *ComputeNodeReconciler) updateService(ctx context.Context, cn *v1alpha1.
 	exp.ObjectMeta = cur.ObjectMeta
 	exp.Spec.ClusterIP = cur.Spec.ClusterIP
 	exp.Spec.ClusterIPs = cur.Spec.ClusterIPs
+
 	if cn.Spec.ServiceType == corev1.ServiceTypeNodePort {
 		exp.Spec.Ports = updateNodePorts(cn.Spec.PortBindings, cur.Spec.Ports)
 	}
-	return r.Update(ctx, exp)
+
+	if !reflect.DeepEqual(exp.Spec, cur.Spec) {
+		return r.Update(ctx, exp)
+	}
+	return nil
 }
 
 func updateServiceNodePort(portBindings []v1alpha1.PortBinding, svcports []corev1.ServicePort) {
@@ -253,10 +286,12 @@ func (r *ComputeNodeReconciler) createConfigMap(ctx context.Context, cn *v1alpha
 func (r *ComputeNodeReconciler) updateConfigMap(ctx context.Context, cn *v1alpha1.ComputeNode, cm *corev1.ConfigMap) error {
 	exp := r.ConfigMap.Build(ctx, cn)
 	exp.ObjectMeta = cm.ObjectMeta
-	exp.ObjectMeta.ResourceVersion = ""
 	exp.Labels = cm.Labels
 	exp.Annotations = cm.Annotations
-	return r.ConfigMap.Update(ctx, exp)
+	if !reflect.DeepEqual(cm.Data, exp.Data) {
+		return r.ConfigMap.Update(ctx, exp)
+	}
+	return nil
 }
 
 func (r *ComputeNodeReconciler) getConfigMapByNamespacedName(ctx context.Context, namespacedName types.NamespacedName) (*corev1.ConfigMap, error) {
@@ -289,9 +324,12 @@ func (r *ComputeNodeReconciler) reconcileStatus(ctx context.Context, cn *v1alpha
 		Namespace: cn.Namespace,
 		Name:      cn.Name,
 	}, service); err != nil {
-		return err
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
 	}
 
+	status := reconcileComputeNodeStatus(podlist, service, cn)
 	rt, err := r.getRuntimeComputeNode(ctx, types.NamespacedName{
 		Namespace: cn.Namespace,
 		Name:      cn.Name,
@@ -299,10 +337,8 @@ func (r *ComputeNodeReconciler) reconcileStatus(ctx context.Context, cn *v1alpha
 	if err != nil {
 		return err
 	}
+	rt.Status = *status
 
-	reconcileComputeNodeStatus(podlist, service, rt)
-
-	// TODO: Compare Status with or without modification
 	return r.Status().Update(ctx, rt)
 }
 
@@ -369,15 +405,14 @@ func updateComputeNodeStatusCondition(conditions []v1alpha1.ComputeNodeCondition
 	return conditions
 }
 
-func reconcileComputeNodeStatus(podlist *corev1.PodList, svc *corev1.Service, cn *v1alpha1.ComputeNode) {
+func reconcileComputeNodeStatus(podlist *corev1.PodList, svc *corev1.Service, cn *v1alpha1.ComputeNode) *v1alpha1.ComputeNodeStatus {
 	conds := reconcile.GetConditionFromPods(podlist)
 
 	cn.Status.Conditions = updateComputeNodeStatusCondition(cn.Status.Conditions, conds)
 
 	ready := getReadyProxyInstances(podlist)
 	cn.Status.Ready = fmt.Sprintf("%d/%d", ready, len(podlist.Items))
-	//TODO: consider removing this readyInstances
-	cn.Status.ReadyInstances = ready
+	cn.Status.Replicas = int32(len(podlist.Items))
 
 	if ready > 0 {
 		cn.Status.Phase = v1alpha1.ComputeNodeStatusReady
@@ -387,6 +422,7 @@ func reconcileComputeNodeStatus(podlist *corev1.PodList, svc *corev1.Service, cn
 
 	cn.Status.LoadBalancer.ClusterIP = svc.Spec.ClusterIP
 	cn.Status.LoadBalancer.Ingress = svc.Status.LoadBalancer.Ingress
+	return &cn.Status
 }
 
 func (r *ComputeNodeReconciler) getRuntimeComputeNode(ctx context.Context, namespacedName types.NamespacedName) (*v1alpha1.ComputeNode, error) {
